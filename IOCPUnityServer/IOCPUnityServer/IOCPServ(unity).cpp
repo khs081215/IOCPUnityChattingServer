@@ -10,6 +10,7 @@
 #define READ	3
 #define	WRITE	5
 #define MAX_CLNT 100
+constexpr int PORT_NUMBER = 9190;
 
 #define LPPER_HANDLE_DATA PER_HANDLE_DATA*
 #define LPPER_IO_DATA PER_IO_DATA*
@@ -33,7 +34,7 @@ class PER_IO_DATA
 public:
 	OVERLAPPED overlapped;
 	WSABUF wsaBuf;
-	wchar_t buffer[BUF_SIZE];
+	char buffer[BUF_SIZE];
 	int rwMode;    // READ or WRITE
 
 
@@ -57,7 +58,7 @@ void ErrorHandling(const char* message);
 int clntCnt = 0;
 SOCKET clntSockets[MAX_CLNT];
 
-int main(int argc, char* argv[])
+int main()
 {
 	WSADATA	wsaData;
 	HANDLE hComPort;
@@ -68,7 +69,6 @@ int main(int argc, char* argv[])
 	SOCKET hServSock;
 	SOCKADDR_IN servAdr;
 	int recvBytes, i, flags = 0;
-	argv[1] = (char*)"9190";
 
 	//윈속을 초기화합니다.
 	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
@@ -87,7 +87,7 @@ int main(int argc, char* argv[])
 	memset(&servAdr, 0, sizeof(servAdr));
 	servAdr.sin_family = AF_INET;
 	servAdr.sin_addr.s_addr = htonl(INADDR_ANY);
-	servAdr.sin_port = htons(atoi(argv[1]));
+	servAdr.sin_port = htons(PORT_NUMBER);
 
 
 	//바인딩 및 리슨 상태로 전환합니다.
@@ -137,10 +137,6 @@ DWORD WINAPI ThreadMain(HANDLE pComPort)
 
 	while (1)
 	{
-		//핸들과 io 객체를 생성합니다
-		handleInfo = (LPPER_HANDLE_DATA)new PER_HANDLE_DATA;
-		ioInfo = (LPPER_IO_DATA)new PER_IO_DATA;
-
 		//호출시 대기스레드 큐에 들어갔다가, IO가 완료되면 LIFO로 큐의 스레드를 깨워서 데이터를 전달받습니다.
 		GetQueuedCompletionStatus(hComPort, &bytesTrans,
 			(PULONG_PTR) & (handleInfo), (LPOVERLAPPED*)&ioInfo, INFINITE);
