@@ -8,10 +8,13 @@
 #include <vector>
 
 
-#define BUF_SIZE 100
+#define BUF_SIZE 1024
 #define READ	3
 #define	WRITE	5
 #define MAX_CLNT 100
+constexpr int RING_SIZE = 4096;
+constexpr int MAX_PACKET = 512;
+constexpr int PREFIX_BYTE = 4;
 constexpr int PORT_NUMBER = 9190;
 
 #define LPPER_HANDLE_DATA PER_HANDLE_DATA*
@@ -20,7 +23,8 @@ constexpr int PORT_NUMBER = 9190;
 /**
 * C# 클라이언트(유니티)와 연동하는 C++ IOCP 서버입니다.
 * 
-* 유니티에서 자동적으로 "[닉네임] : 채팅내용" 으로 변환되어 서버에 전송되기에, '['로 시작하는 메세지만 접속한 모든 클라이언트에 전송합니다.
+* 메시지는 [4바이트 길이(Big Endian)][본문] 형식으로 주고받으며,
+* 세션별 링 버퍼에 누적한 뒤 완성된 패킷 단위로 분리해 전체 클라이언트에 브로드캐스트합니다.
 */
 
 
@@ -29,6 +33,63 @@ class PER_HANDLE_DATA
 public:
     SOCKET hClntSock;
     SOCKADDR_IN clntAdr;
+    
+    //링 버퍼
+    std::vector<char> receiveBuffer=std::vector<char>(RING_SIZE);
+    
+    //읽을 지점
+    size_t readPos = 0;
+    //다음에 쓸 지점
+    size_t writePos = 0;
+    
+    //의도적으로 하나를 비워서 원형 큐를 관리. 즉, 사이즈 = RING_SIZE-1
+    bool IsFull()
+    {
+        return ((writePos + 1) % RING_SIZE == readPos);
+    }
+    
+    bool IsEmpty()
+    {
+        return (readPos == writePos);
+    }
+    
+    bool Push(char& inChar)
+    {
+        if (IsFull()) return false;
+        receiveBuffer[writePos]=inChar;
+        writePos = (writePos + 1) % RING_SIZE;
+        return true;
+    }
+    
+    char Pop()
+    {
+        char data = receiveBuffer[readPos];
+        readPos = (readPos + 1) % RING_SIZE;
+        return data;
+    }
+    
+    size_t GetSize()
+    {
+        if (writePos >= readPos)
+            return writePos - readPos;
+
+        return RING_SIZE + writePos- readPos;
+    }
+    
+    bool Peek(void* outBuffer, size_t peekSize)
+    {
+        if (peekSize>GetSize()) return false;
+        char* dest = static_cast<char*>(outBuffer);
+        
+        size_t readPosBuffer;   
+        for (int i=0;i<peekSize;i++)
+        {
+            readPosBuffer = readPos+i;
+            readPosBuffer=(readPosBuffer) % RING_SIZE;
+            dest[i]=receiveBuffer[readPosBuffer];
+        }
+        return true;
+    }
 };
 
 class PER_IO_DATA
@@ -57,6 +118,8 @@ int clntCnt = 0;
 SOCKET clntSockets[MAX_CLNT];
 std::mutex clntMutex;
 
+void BroadCast(std::vector<char>* inCharData, DWORD& inBytesTrans);
+void EndSocket(SOCKET& inSocket,LPPER_HANDLE_DATA& inHandleInfo, LPPER_IO_DATA& inIoInfo);
 
 int main()
 {
@@ -106,6 +169,11 @@ int main()
         //(뮤텍스) 접속중인 소켓 배열에 추가합니다.
         {
             std::lock_guard<std::mutex> lock(clntMutex);
+            if (clntCnt >= MAX_CLNT)
+            {
+                closesocket(hClntSock);
+                continue;
+            }
             clntSockets[clntCnt++] = hClntSock;
         }
 
@@ -122,11 +190,24 @@ int main()
 
 
         //recv 
-        WSARecv(handleInfo->hClntSock, &(ioInfo->wsaBuf),
+        int resultInt=WSARecv(handleInfo->hClntSock, &(ioInfo->wsaBuf),
                 1, (LPDWORD)&recvBytes, (LPDWORD)&flags, &(ioInfo->overlapped), NULL);
+        
+        if (resultInt == SOCKET_ERROR)
+        {
+            int error = WSAGetLastError();
+
+            if (error != WSA_IO_PENDING)
+            {
+                EndSocket(hClntSock, handleInfo, ioInfo);
+                continue;
+            }
+        }
     }
     return 0;
 }
+
+
 
 //입출력용 스레드
 DWORD WINAPI ThreadMain(HANDLE pComPort)
@@ -149,65 +230,101 @@ DWORD WINAPI ThreadMain(HANDLE pComPort)
         if (ioInfo->rwMode == READ)
         {
             std::cout << "Message Recieved!\n";
+            std::cout << "Received Bytes : " << bytesTrans << "\n";
             if (bytesTrans == 0) // EOF 전송 시
             {
-                std::cout << "CloseSocket\n";
-                //(뮤텍스)접속중인 소켓 배열에서 삭제
-                {
-                    std::lock_guard<std::mutex> lock(clntMutex);
-                    for (int i = 0; i < clntCnt; i++)
-                    {
-                        if (clntSockets[i] == sock)
-                        {
-                            while (i < clntCnt - 1)
-                            {
-                                clntSockets[i] = clntSockets[i + 1];
-                                i++;
-                            }
-                            break;
-                        }
-                    }
-                    clntCnt--;
-                }
-                closesocket(sock);
-                delete handleInfo;
-                delete ioInfo;
+                EndSocket(sock,handleInfo,ioInfo);
                 continue;
             }
 
             ioInfo->wsaBuf.len = bytesTrans;
-            ioInfo->rwMode = WRITE;
 
-            //(채팅 :시작이 '['일 경우)모든 클라이언트에게 메시지 전송
-            if (ioInfo->wsaBuf.buf[0] == (byte)'[')
+            bool bIsEndSocket = false;
+            //핸들별 receive버퍼에 추가
+            for (int i=0;i<bytesTrans;i++)
             {
-                // (뮤텍스) 브로드캐스트 도중 배열이 바뀌는 것을 방지하기 위해 스냅샷 적용 　				
-                std::vector<SOCKET> targets;
+                // 링버퍼 overflow → 비정상 클라이언트로 간주하고 연결 종료
+                if (!handleInfo->Push(ioInfo->buffer[i]))
                 {
-                    std::lock_guard<std::mutex> lock(clntMutex);
-                    targets.assign(clntSockets, clntSockets + clntCnt); // 복사만
-                }
-
-
-                for (SOCKET clientSocket : targets)
-                {
-                    //수신자마다 PER_IO_DATA를 가지도록 함							
-                    LPPER_IO_DATA sendInfo = new PER_IO_DATA;
-                    memcpy(sendInfo->buffer, ioInfo->buffer, bytesTrans);
-                    sendInfo->wsaBuf.len = bytesTrans;
-                    sendInfo->rwMode = WRITE;
-                    WSASend(clientSocket, &(sendInfo->wsaBuf), 1, NULL, 0,
-                            &(sendInfo->overlapped), NULL);
+                    EndSocket(sock,handleInfo,ioInfo);
+                    bIsEndSocket=true;
+                    break;
                 }
             }
+            if (bIsEndSocket) continue;
+            
+            while (true)
+            {
+                // Prefix를 다 받았을 경우
+                if (handleInfo->GetSize() >= PREFIX_BYTE)
+                {
+                    uint32_t length;
+                    if (!handleInfo->Peek(&length, PREFIX_BYTE))
+                    {
+                        break;
+                    }
+                    length = ntohl(length);
+                    
+                    std::cout << "Length : " << length << "\n";
+                    
+                    //MAX_PACKET를 넘는 패킷일 경우 잘못된 패킷
+                    if (length>MAX_PACKET)
+                    {
+                        EndSocket(sock,handleInfo,ioInfo);
+                        bIsEndSocket=true;
+                        break;
+                    }
 
+                    //메세지를 전부 받았을 경우
+                    if (handleInfo->GetSize() >= PREFIX_BYTE + length)
+                    {
+                        //Prefix 전부 제거
+                        for (int i=0;i<PREFIX_BYTE;i++)
+                        {
+                            handleInfo->Pop();
+                        }
+                        
+                        //메세지를 추출
+                        std::vector<char> buffer;
+                        for (int i=0;i<length;i++)
+                        {
+                            buffer.push_back(handleInfo->Pop());
+                        }
+                        DWORD messageLength=length;
+                        
+                        BroadCast(&buffer, messageLength);
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+                else
+                {
+                    break;
+                }
+            }
+            if (bIsEndSocket) continue;
+            
+            delete ioInfo;
             //전송 후 ioInfo 초기화
             ioInfo = (LPPER_IO_DATA)new PER_IO_DATA;
 
             //READ상태로 변경 및 recv
             ioInfo->rwMode = READ;
-            WSARecv(sock, &(ioInfo->wsaBuf),
+            int resultInt=WSARecv(sock, &(ioInfo->wsaBuf),
                     1, NULL, &flags, &(ioInfo->overlapped), NULL);
+            
+            if (resultInt == SOCKET_ERROR)
+            {
+                int error = WSAGetLastError();
+
+                if (error != WSA_IO_PENDING)
+                {
+                    EndSocket(sock, handleInfo, ioInfo);
+                    continue;
+                }
+            }
         }
         //다른 스레드에서 send시
         else
@@ -217,6 +334,65 @@ DWORD WINAPI ThreadMain(HANDLE pComPort)
         }
     }
     return 0;
+}
+
+void BroadCast(std::vector<char>* inCharData,DWORD& inBytesTrans)
+{
+    // (뮤텍스) 브로드캐스트 도중 배열이 바뀌는 것을 방지하기 위해 스냅샷 적용 　				
+    std::vector<SOCKET> targets;
+    {
+        std::lock_guard<std::mutex> lock(clntMutex);
+        targets.assign(clntSockets, clntSockets + clntCnt); // 복사만
+    }
+    for (SOCKET clientSocket : targets)
+    {
+        //수신자마다 PER_IO_DATA를 가지도록 함							
+        LPPER_IO_DATA sendInfo = new PER_IO_DATA;
+        memcpy(sendInfo->buffer, inCharData->data(), inBytesTrans);
+        sendInfo->wsaBuf.len = inBytesTrans;
+        sendInfo->rwMode = WRITE;
+        int sendInt=WSASend(clientSocket, &(sendInfo->wsaBuf), 1, NULL, 0,
+                &(sendInfo->overlapped), NULL);
+        
+        //스냅샷의 대상이 유효하지 않아 WSASend가 되지 않은 경우
+        if (sendInt==SOCKET_ERROR)
+        {
+            //WSA_IO_PENDING은 정상적인 비동기 에러이므로 할당해제하지 않음
+            int error = WSAGetLastError();
+
+            if (error != WSA_IO_PENDING)
+            {
+                delete sendInfo;
+            }
+        }
+    }
+}
+
+void EndSocket(SOCKET& inSocket,LPPER_HANDLE_DATA& inHandleInfo, LPPER_IO_DATA& inIoInfo)
+{
+    std::cout << "CloseSocket\n";
+    //(뮤텍스)접속중인 소켓 배열에서 삭제
+    {
+        std::lock_guard<std::mutex> lock(clntMutex);
+        bool bIsFound=false;
+        for (int i = 0; i < clntCnt; i++)
+        {
+            if (clntSockets[i] == inSocket)
+            {
+                while (i < clntCnt - 1)
+                {
+                    clntSockets[i] = clntSockets[i + 1];
+                    i++;
+                }
+                bIsFound=true;
+                break;
+            }
+        }
+        if (bIsFound) clntCnt--;
+    }
+    closesocket(inSocket);
+    //delete inHandleInfo;
+    delete inIoInfo;
 }
 
 void ErrorHandling(const char* message)
