@@ -1,9 +1,11 @@
 ﻿#include <iostream>
+#include <mutex>
 #include <stdlib.h>
 #include <process.h>
 #include <winsock2.h>
 #include <windows.h>
 #include <thread>
+#include <vector>
 
 
 #define BUF_SIZE 100
@@ -57,6 +59,8 @@ void ErrorHandling(const char* message);
 
 int clntCnt = 0;
 SOCKET clntSockets[MAX_CLNT];
+std::mutex clntMutex;
+
 
 int main()
 {
@@ -103,8 +107,11 @@ int main()
 		//accept
 		hClntSock = accept(hServSock, (SOCKADDR*)&clntAdr, &addrLen);
 		
-		//접속중인 소켓 배열에 추가합니다.
-		clntSockets[clntCnt++] = hClntSock;
+		//(뮤텍스) 접속중인 소켓 배열에 추가합니다.
+		{
+			std::lock_guard<std::mutex> lock(clntMutex);
+			clntSockets[clntCnt++] = hClntSock;
+		}
 
 		//핸들 객체 생성 및 입력합니다.
 		handleInfo = (LPPER_HANDLE_DATA)new PER_HANDLE_DATA;
@@ -149,20 +156,23 @@ DWORD WINAPI ThreadMain(HANDLE pComPort)
 			if (bytesTrans == 0)    // EOF 전송 시
 			{
 				std::cout << "CloseSocket\n";
-				//접속중인 소켓 배열에서 삭제
-				for (int i = 0; i < clntCnt; i++)
+				//(뮤텍스)접속중인 소켓 배열에서 삭제
 				{
-					if (clntSockets[i] == sock)
+					std::lock_guard<std::mutex> lock(clntMutex);
+					for (int i = 0; i < clntCnt; i++)
 					{
-						while (i < clntCnt - 1)
+						if (clntSockets[i] == sock)
 						{
-							clntSockets[i] = clntSockets[i + 1];
-							i++;
+							while (i < clntCnt - 1)
+							{
+								clntSockets[i] = clntSockets[i + 1];
+								i++;
+							}
+							break;
 						}
-						break;
 					}
+					clntCnt--;
 				}
-				clntCnt--;
 				closesocket(sock);
 				delete handleInfo; 
 				delete ioInfo;
@@ -174,9 +184,23 @@ DWORD WINAPI ThreadMain(HANDLE pComPort)
 
 			//(채팅 :시작이 '['일 경우)모든 클라이언트에게 메시지 전송
 			if (ioInfo->wsaBuf.buf[0] == (byte)'[') {
-				for (int i = 0; i < clntCnt; i++)
+				// (뮤텍스) 브로드캐스트 도중 배열이 바뀌는 것을 방지하기 위해 스냅샷 적용 　				
+				std::vector<SOCKET> targets;
 				{
-					WSASend(clntSockets[i], &(ioInfo->wsaBuf), 1, NULL, 0, &(ioInfo->overlapped), NULL);
+					std::lock_guard<std::mutex> lock(clntMutex);
+					targets.assign(clntSockets, clntSockets + clntCnt);   // 복사만
+				}
+				
+				
+				for (SOCKET clientSocket : targets)
+				{
+					//수신자마다 PER_IO_DATA를 가지도록 함							
+					LPPER_IO_DATA sendInfo = new PER_IO_DATA;   
+					memcpy(sendInfo->buffer, ioInfo->buffer, bytesTrans);
+					sendInfo->wsaBuf.len = bytesTrans;
+					sendInfo->rwMode = WRITE;
+					WSASend(clientSocket, &(sendInfo->wsaBuf), 1, NULL, 0,
+							&(sendInfo->overlapped), NULL);
 				}
 			}
 
@@ -192,6 +216,7 @@ DWORD WINAPI ThreadMain(HANDLE pComPort)
 		else
 		{
 			std::cout << "Message Sent!\n";
+			delete ioInfo;
 		}
 	}
 	return 0;
